@@ -102,129 +102,256 @@ void sqlbox_configure_mysql(Cfg* cfg)
 
 #define octstr_null_create(x) ((x != NULL) ? octstr_create(x) : octstr_create(""))
 #define atol_null(x) ((x != NULL) ? atol(x) : -1)
+
+/* Map one MySQL row into a Msg (foreign_id holds sql_id). */
+static Msg *mysql_msg_from_row(MYSQL_ROW row)
+{
+    Msg *msg;
+
+    msg = msg_create(sms);
+    /* we abuse the foreign_id field in the message struct for our sql_id value */
+    msg->sms.foreign_id = octstr_null_create(row[0]);
+    msg->sms.sender = octstr_null_create(row[2]);
+    msg->sms.receiver = octstr_null_create(row[3]);
+    msg->sms.udhdata = octstr_null_create(row[4]);
+    msg->sms.msgdata = octstr_null_create(row[5]);
+    msg->sms.time = atol_null(row[6]);
+    msg->sms.smsc_id = octstr_null_create(row[7]);
+    msg->sms.service = octstr_null_create(row[8]);
+    msg->sms.account = octstr_null_create(row[9]);
+    msg->sms.sms_type = atol_null(row[11]);
+    msg->sms.mclass = atol_null(row[12]);
+    msg->sms.mwi = atol_null(row[13]);
+    msg->sms.coding = atol_null(row[14]);
+    msg->sms.compress = atol_null(row[15]);
+    msg->sms.validity = atol_null(row[16]);
+    msg->sms.deferred = atol_null(row[17]);
+    msg->sms.dlr_mask = atol_null(row[18]);
+    msg->sms.dlr_url = octstr_null_create(row[19]);
+    msg->sms.pid = atol_null(row[20]);
+    msg->sms.alt_dcs = atol_null(row[21]);
+    msg->sms.rpi = atol_null(row[22]);
+    msg->sms.charset = octstr_null_create(row[23]);
+    msg->sms.binfo = octstr_null_create(row[25]);
+    msg->sms.meta_data = octstr_null_create(row[26]);
+    msg->sms.priority = atol_null(row[27]);
+    if (row[24] == NULL) {
+        msg->sms.boxc_id = octstr_duplicate(sqlbox_id);
+    }
+    else {
+        msg->sms.boxc_id = octstr_null_create(row[24]);
+    }
+    return msg;
+}
+
+/*
+ * Single connection: BEGIN; SELECT … FOR UPDATE; DELETE; COMMIT keeps row claim atomic
+ * for multiple sqlboxes sharing send_sms.
+ */
 Msg *mysql_fetch_msg()
 {
     Msg *msg = NULL;
-    Octstr *sql, *delet, *id;
-    MYSQL_RES *res;
+    Octstr *sql = NULL;
+    Octstr *delet = NULL;
+    MYSQL_RES *res = NULL;
     MYSQL_ROW row;
+    MYSQL *conn;
+    DBPoolConn *pc;
+
+    pc = dbpool_conn_consume(pool);
+    if (pc == NULL) {
+        error(0, "MYSQL: Database pool got no connection! DB update failed!");
+        return NULL;
+    }
+    conn = pc->conn;
 
     sql = octstr_format(SQLBOX_MYSQL_SELECT_QUERY, sqlbox_insert_table);
-    res = mysql_select(sql);
-    if (res == NULL) {
-        debug("sqlbox", 0, "SQL statement failed: %s", octstr_get_cstr(sql));
+
+    mysql_autocommit(conn, 0);
+    if (mysql_query(conn, "START TRANSACTION") != 0) {
+        error(0, "MYSQL START TRANSACTION: %s", mysql_error(conn));
+        goto fail_tx_early;
     }
-    else {
-        if (mysql_num_rows(res) >= 1) {
-            row = mysql_fetch_row(res);
-            id = octstr_null_create(row[0]);
-            /* save fields in this row as msg struct */
-            msg = msg_create(sms);
-            /* we abuse the foreign_id field in the message struct for our sql_id value */
-            msg->sms.foreign_id = octstr_null_create(row[0]);
-            msg->sms.sender     = octstr_null_create(row[2]);
-            msg->sms.receiver   = octstr_null_create(row[3]);
-            msg->sms.udhdata    = octstr_null_create(row[4]);
-            msg->sms.msgdata    = octstr_null_create(row[5]);
-            msg->sms.time       = atol_null(row[6]);
-            msg->sms.smsc_id    = octstr_null_create(row[7]);
-            msg->sms.service    = octstr_null_create(row[8]);
-            msg->sms.account    = octstr_null_create(row[9]);
-            msg->sms.sms_type   = atol_null(row[11]);
-            msg->sms.mclass     = atol_null(row[12]);
-            msg->sms.mwi        = atol_null(row[13]);
-            msg->sms.coding     = atol_null(row[14]);
-            msg->sms.compress   = atol_null(row[15]);
-            msg->sms.validity   = atol_null(row[16]);
-            msg->sms.deferred   = atol_null(row[17]);
-            msg->sms.dlr_mask   = atol_null(row[18]);
-            msg->sms.dlr_url    = octstr_null_create(row[19]);
-            msg->sms.pid        = atol_null(row[20]);
-            msg->sms.alt_dcs    = atol_null(row[21]);
-            msg->sms.rpi        = atol_null(row[22]);
-            msg->sms.charset    = octstr_null_create(row[23]);
-            msg->sms.binfo      = octstr_null_create(row[25]);
-            msg->sms.meta_data  = octstr_null_create(row[26]);
-            msg->sms.priority   = atol_null(row[27]);
-            if (row[24] == NULL) {
-                msg->sms.boxc_id= octstr_duplicate(sqlbox_id);
-            }
-            else {
-                msg->sms.boxc_id= octstr_null_create(row[24]);
-            }
-            /* delete current row */
-            delet = octstr_format(SQLBOX_MYSQL_DELETE_QUERY, sqlbox_insert_table, id);
-#if defined(SQLBOX_TRACE)
-            debug("SQLBOX", 0, "sql: %s", octstr_get_cstr(delet));
-#endif
-            mysql_update(delet);
-            octstr_destroy(id);
-            octstr_destroy(delet);
+    if (mysql_query(conn, octstr_get_cstr(sql)) != 0) {
+        error(0, "MYSQL: %s", mysql_error(conn));
+        if (mysql_errno(conn) == MYSQL_ERR_NOSUCHFIELD) {
+            error(0, "Try to recreate insert and log tables. The structure may have changed. See ChangeLog.");
         }
-        mysql_free_result(res);
+        goto fail_tx;
     }
     octstr_destroy(sql);
+    sql = NULL;
+
+    res = mysql_store_result(conn);
+    if (res == NULL) {
+        debug("sqlbox", 0, "SQL statement mysql_store_result failed: %s", mysql_error(conn));
+        goto fail_tx;
+    }
+    if (mysql_num_rows(res) < 1) {
+        mysql_free_result(res);
+        res = NULL;
+        mysql_query(conn, "COMMIT");
+        mysql_autocommit(conn, 1);
+        dbpool_conn_produce(pc);
+        return NULL;
+    }
+
+    row = mysql_fetch_row(res);
+    msg = mysql_msg_from_row(row);
+    mysql_free_result(res);
+    res = NULL;
+
+    delet = octstr_format(SQLBOX_MYSQL_DELETE_QUERY, sqlbox_insert_table, msg->sms.foreign_id);
+#if defined(SQLBOX_TRACE)
+    debug("SQLBOX", 0, "sql: %s", octstr_get_cstr(delet));
+#endif
+    if (mysql_query(conn, octstr_get_cstr(delet)) != 0) {
+        error(0, "MYSQL (DELETE/fetch-msg): %s", mysql_error(conn));
+        msg_destroy(msg);
+        msg = NULL;
+        octstr_destroy(delet);
+        delet = NULL;
+        goto fail_tx;
+    }
+    octstr_destroy(delet);
+
+    mysql_query(conn, "COMMIT");
+    mysql_autocommit(conn, 1);
+    dbpool_conn_produce(pc);
     return msg;
+
+fail_tx:
+    mysql_query(conn, "ROLLBACK");
+fail_tx_early:
+    mysql_autocommit(conn, 1);
+    if (res != NULL)
+        mysql_free_result(res);
+    octstr_destroy(sql);
+    octstr_destroy(delet);
+    if (msg != NULL) {
+        msg_destroy(msg);
+        msg = NULL;
+    }
+    dbpool_conn_produce(pc);
+    return NULL;
 }
 
 int mysql_fetch_msg_list(List *qlist, long limit)
 {
     Msg *msg = NULL;
-    Octstr *sql, *delet, *id;
-    MYSQL_RES *res;
+    Octstr *sql = NULL;
+    Octstr *delet = NULL;
+    Octstr *ids = NULL;
+    MYSQL_RES *res = NULL;
     MYSQL_ROW row;
+    MYSQL *conn;
+    DBPoolConn *pc;
     int ret = 0;
+    int first_id = 1;
+
+    if (limit <= 0)
+        return 0;
+
+    pc = dbpool_conn_consume(pool);
+    if (pc == NULL) {
+        error(0, "MYSQL: Database pool got no connection! DB update failed!");
+        return 0;
+    }
+    conn = pc->conn;
+
+    mysql_autocommit(conn, 0);
+    if (mysql_query(conn, "START TRANSACTION") != 0) {
+        error(0, "MYSQL START TRANSACTION (batch): %s", mysql_error(conn));
+        goto fail_early;
+    }
 
     sql = octstr_format(SQLBOX_MYSQL_SELECT_LIST_QUERY, sqlbox_insert_table, limit);
-    res = mysql_select(sql);
-    if (res == NULL) {
-        debug("sqlbox", 0, "SQL statement failed: %s", octstr_get_cstr(sql));
-    }
-    else {
-	ret = mysql_num_rows(res);
-        if (ret >= 1) {
-            while (row = mysql_fetch_row(res)) {
-                /* save fields in this row as msg struct */
-                msg = msg_create(sms);
-                /* we abuse the foreign_id field in the message struct for our sql_id value */
-                msg->sms.foreign_id = octstr_null_create(row[0]);
-                msg->sms.sender     = octstr_null_create(row[2]);
-                msg->sms.receiver   = octstr_null_create(row[3]);
-                msg->sms.udhdata    = octstr_null_create(row[4]);
-                msg->sms.msgdata    = octstr_null_create(row[5]);
-                msg->sms.time       = atol_null(row[6]);
-                msg->sms.smsc_id    = octstr_null_create(row[7]);
-                msg->sms.service    = octstr_null_create(row[8]);
-                msg->sms.account    = octstr_null_create(row[9]);
-                msg->sms.sms_type   = atol_null(row[11]);
-                msg->sms.mclass     = atol_null(row[12]);
-                msg->sms.mwi        = atol_null(row[13]);
-                msg->sms.coding     = atol_null(row[14]);
-                msg->sms.compress   = atol_null(row[15]);
-                msg->sms.validity   = atol_null(row[16]);
-                msg->sms.deferred   = atol_null(row[17]);
-                msg->sms.dlr_mask   = atol_null(row[18]);
-                msg->sms.dlr_url    = octstr_null_create(row[19]);
-                msg->sms.pid        = atol_null(row[20]);
-                msg->sms.alt_dcs    = atol_null(row[21]);
-                msg->sms.rpi        = atol_null(row[22]);
-                msg->sms.charset    = octstr_null_create(row[23]);
-                msg->sms.binfo      = octstr_null_create(row[25]);
-                msg->sms.meta_data  = octstr_null_create(row[26]);
-                msg->sms.priority   = atol_null(row[27]);
-                if (row[24] == NULL) {
-                    msg->sms.boxc_id= octstr_duplicate(sqlbox_id);
-                }
-                else {
-                    msg->sms.boxc_id= octstr_null_create(row[24]);
-                }
-                gwlist_produce(qlist, msg);
-            }
+    if (mysql_query(conn, octstr_get_cstr(sql)) != 0) {
+        error(0, "MYSQL: %s", mysql_error(conn));
+        if (mysql_errno(conn) == MYSQL_ERR_NOSUCHFIELD) {
+            error(0, "Try to recreate insert and log tables. The structure may have changed. See ChangeLog.");
         }
-        mysql_free_result(res);
+        goto fail_tx;
     }
     octstr_destroy(sql);
+    sql = NULL;
+
+    res = mysql_store_result(conn);
+    if (res == NULL) {
+        debug("sqlbox", 0, "SQL statement mysql_store_result failed: %s", mysql_error(conn));
+        goto fail_tx;
+    }
+
+    ret = mysql_num_rows(res);
+    if (ret < 1) {
+        mysql_free_result(res);
+        res = NULL;
+        mysql_query(conn, "COMMIT");
+        mysql_autocommit(conn, 1);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
+    ids = octstr_create("");
+    gwlist_add_producer(qlist);
+
+    while ((row = mysql_fetch_row(res)) != NULL) {
+        if (row[0] != NULL) {
+            if (!first_id)
+                octstr_append_char(ids, ',');
+            octstr_append_cstr(ids, row[0]);
+            first_id = 0;
+        }
+        msg = mysql_msg_from_row(row);
+        gwlist_produce(qlist, msg);
+    }
+    mysql_free_result(res);
+    res = NULL;
+
+    if (octstr_len(ids) < 1) {
+        error(0, "MYSQL (batch): missing sql_id on queued row(s); rolling back");
+        octstr_destroy(ids);
+        goto fail_batch_msgs;
+    }
+
+    delet = octstr_format(SQLBOX_MYSQL_DELETE_LIST_QUERY, sqlbox_insert_table, ids);
+    octstr_destroy(ids);
+    ids = NULL;
+
+    if (mysql_query(conn, octstr_get_cstr(delet)) != 0) {
+        error(0, "MYSQL (DELETE/batch): %s", mysql_error(conn));
+        octstr_destroy(delet);
+        delet = NULL;
+        goto fail_batch_msgs;
+    }
+    octstr_destroy(delet);
+
+    mysql_query(conn, "COMMIT");
+    mysql_autocommit(conn, 1);
+    gwlist_remove_producer(qlist);
+    dbpool_conn_produce(pc);
     return ret;
+
+fail_batch_msgs:
+    mysql_query(conn, "ROLLBACK");
+    while (gwlist_len(qlist) > 0 && (msg = gwlist_consume(qlist)) != NULL)
+        msg_destroy(msg);
+    gwlist_remove_producer(qlist);
+    mysql_autocommit(conn, 1);
+    dbpool_conn_produce(pc);
+    return 0;
+
+fail_tx:
+    mysql_query(conn, "ROLLBACK");
+fail_early:
+    mysql_autocommit(conn, 1);
+    if (res != NULL)
+        mysql_free_result(res);
+    octstr_destroy(sql);
+    octstr_destroy(ids);
+    octstr_destroy(delet);
+    dbpool_conn_produce(pc);
+    return 0;
 }
 
 static Octstr *get_numeric_value_or_return_null(long int num)
@@ -278,12 +405,14 @@ void mysql_save_list(List *qlist, Octstr *momt, int save_mt)
     Octstr *sql, *values, *ids, *sep;
     Octstr *stuffer[30];
     int stuffcount = 0, first = 1;
+    int had_rows = 0;
     Msg *msg;
 
     values = save_mt ? octstr_create("") : NULL;
     ids = octstr_create("");
     sep = octstr_imm("");
     while (gwlist_len(qlist) > 0 && (msg = gwlist_consume(qlist)) != NULL) {
+        had_rows = 1;
         if (save_mt) {
             /* convert into urlencoded tekst first */
             octstr_url_encode(msg->sms.msgdata);
@@ -307,16 +436,22 @@ void mysql_save_list(List *qlist, Octstr *momt, int save_mt)
             octstr_destroy(stuffer[--stuffcount]);
         }
     }
-    if (save_mt) {
+    if (save_mt && had_rows) {
         sql = octstr_format(SQLBOX_MYSQL_INSERT_LIST_QUERY, sqlbox_logtable, values);
         octstr_destroy(values);
         sql_update(sql);
         octstr_destroy(sql);
+    } else if (values != NULL) {
+        octstr_destroy(values);
     }
-    sql = octstr_format(SQLBOX_MYSQL_DELETE_LIST_QUERY, sqlbox_insert_table, ids);
-    octstr_destroy(ids);
-    sql_update(sql);
-    octstr_destroy(sql);
+    if (had_rows) {
+        sql = octstr_format(SQLBOX_MYSQL_DELETE_LIST_QUERY, sqlbox_insert_table, ids);
+        octstr_destroy(ids);
+        sql_update(sql);
+        octstr_destroy(sql);
+    } else {
+        octstr_destroy(ids);
+    }
 }
 
 void mysql_leave()

@@ -466,6 +466,9 @@ void octstr_dump_short(Octstr *ostr, int level, const char *name);
 int octstr_url_decode(Octstr *ostr);
 
 
+int octstr_url_decode_permissive(Octstr *ostr);
+
+
 /*
  * URL encode the argument string in place.
  */

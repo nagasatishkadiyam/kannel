@@ -1545,6 +1545,12 @@ error:
 }
 
 
+int octstr_url_decode_permissive(Octstr *ostr)
+{
+    return octstr_url_decode(ostr);
+}
+
+
 long octstr_get_bits(Octstr *ostr, long bitpos, int numbits)
 {
     long pos;

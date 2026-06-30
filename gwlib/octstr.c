@@ -1743,7 +1743,12 @@ void octstr_url_encode(Octstr *ostr)
 }
 
 
-int octstr_url_decode(Octstr *ostr)
+/*
+ * strict: if false, invalid %XX sequences are left as literal bytes (still
+ * logged) and the function returns 0; strict mode returns -1 for those cases.
+ * Truncated '%' at end-of-string always yields -1.
+ */
+static int octstr_url_decode_internal(Octstr *ostr, int strict)
 {
     unsigned char *string;
     unsigned char *dptr;
@@ -1778,7 +1783,8 @@ int octstr_url_decode(Octstr *ostr)
                 *dptr++ = *string++;
                 *dptr++ = *string++;
                 *dptr++ = *string++;
-                ret = -1;
+                if (strict)
+                    ret = -1;
                 continue;
             }
 
@@ -1797,6 +1803,18 @@ int octstr_url_decode(Octstr *ostr)
 
     seems_valid(ostr);
     return ret;
+}
+
+
+int octstr_url_decode(Octstr *ostr)
+{
+    return octstr_url_decode_internal(ostr, 1);
+}
+
+
+int octstr_url_decode_permissive(Octstr *ostr)
+{
+    return octstr_url_decode_internal(ostr, 0);
 }
 
 

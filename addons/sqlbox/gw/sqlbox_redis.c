@@ -20,6 +20,20 @@ static Octstr* boxc_id;
 
 static DBPool* pool = NULL;
 
+/*
+ * Atomically take up to ARGV[1] elements from list KEYS[1] (LRANGE left head + LTRIM).
+ * Without this script, concurrent sqlboxes each run LLEN/LRANGE/LTRIM and duplicate messages.
+ */
+static const char sqlbox_redis_batch_pop_script[] =
+    "local n = redis.call('LLEN', KEYS[1]) "
+    "if n <= 0 then return {} end "
+    "local limit = tonumber(ARGV[1]) or 0 "
+    "local pick = (limit > 0 and n > limit) and limit or n "
+    "if pick <= 0 then return {} end "
+    "local elems = redis.call('LRANGE', KEYS[1], 0, pick - 1) "
+    "redis.call('LTRIM', KEYS[1], pick, -1) "
+    "return elems";
+
 static void redis_update(const Octstr* sql, const Octstr* data)
 {
     redisReply* reply;
@@ -227,18 +241,16 @@ Msg* redis_fetch_msg()
 int redis_fetch_msg_list(List* qlist, long limit)
 {
     Msg* msg = NULL;
-    Octstr *subst, *jsonstr;
     redisReply* res = NULL;
-    redisReply* result = NULL;
     char* resjson;
     json_t *root, *jsonmsg;
     json_error_t json_error;
     DBPoolConn* pc;
-    Octstr* cmd;
-    int total;
-    int pick;
     int j;
     int k = 0;
+
+    if (limit <= 0)
+        return 0;
 
     pc = dbpool_conn_consume(pool);
     if (pc == NULL) {
@@ -246,48 +258,29 @@ int redis_fetch_msg_list(List* qlist, long limit)
         return 0;
     }
 
-    cmd = octstr_format("LLEN %S", sqlbox_insert_table);
-    res = redisCommand(pc->conn, octstr_get_cstr(cmd));
-    octstr_destroy(cmd);
+    res = redisCommand(pc->conn, "EVAL %s 1 %s %ld",
+                       sqlbox_redis_batch_pop_script,
+                       octstr_get_cstr(sqlbox_insert_table),
+                       limit);
+    if (res == NULL) {
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
     if (res->type == REDIS_REPLY_ERROR) {
         error(0, "REDIS: %s", res->str);
         freeReplyObject(res);
         dbpool_conn_produce(pc);
         return 0;
-    } else if (res->type == REDIS_REPLY_NIL) {
-        freeReplyObject(res);
-        dbpool_conn_produce(pc);
-        return 0;
     }
-
-    total = res->integer;
-
-    if (total <= 0) {
-        freeReplyObject(res);
-        dbpool_conn_produce(pc);
-        return 0;
-    }
-
-    freeReplyObject(res);
-
-    pick = total > limit ? limit : total;
-
-    cmd = octstr_format("LRANGE %S 0 %d", sqlbox_insert_table, pick - 1);
-    redisAppendCommand(pc->conn, octstr_get_cstr(cmd));
-    octstr_destroy(cmd);
-    cmd = octstr_format("LTRIM %S %d -1", sqlbox_insert_table, pick);
-    redisAppendCommand(pc->conn, octstr_get_cstr(cmd));
-    octstr_destroy(cmd);
-    if (redisGetReply(pc->conn, (void*)&res) != REDIS_OK) {
-        freeReplyObject(res);
-        dbpool_conn_produce(pc);
-        return 0;
-    }
-
-    redisGetReply(pc->conn, (void*)&result);
-    freeReplyObject(result);
 
     if (res->type != REDIS_REPLY_ARRAY) {
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
+    if (res->elements == 0) {
         freeReplyObject(res);
         dbpool_conn_produce(pc);
         return 0;
@@ -319,7 +312,7 @@ int redis_fetch_msg_list(List* qlist, long limit)
     dbpool_conn_produce(pc);
     freeReplyObject(res);
 
-    return pick;
+    return k;
 }
 
 Msg* redis_create_msg(json_t* jsonmsg)

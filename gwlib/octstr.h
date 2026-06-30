@@ -581,6 +581,14 @@ int octstr_url_decode(Octstr *ostr);
 
 
 /*
+ * Same as octstr_url_decode, but invalid %XX sequences are kept literally
+ * and 0 is returned (still logged). Use where input may mix URL encoding
+ * with raw text (e.g. sqlbox msgdata from external writers).
+ */
+int octstr_url_decode_permissive(Octstr *ostr);
+
+
+/*
  * URL encode the argument string in place.
  */
 void octstr_url_encode(Octstr *ostr);

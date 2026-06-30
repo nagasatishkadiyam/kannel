@@ -194,10 +194,10 @@ static int charset_processing(Msg *msg)
 {
     gw_assert(msg->type == sms);
 
-    /* URL-decode first */
-    if (octstr_url_decode(msg->sms.msgdata) == -1)
+    /* URL-decode first (permissive: plain text rows may contain stray '%') */
+    if (octstr_url_decode_permissive(msg->sms.msgdata) == -1)
         return -1;
-    if (octstr_url_decode(msg->sms.udhdata) == -1)
+    if (octstr_url_decode_permissive(msg->sms.udhdata) == -1)
         return -1;
         
     /* If a specific character encoding has been indicated by the
@@ -600,7 +600,7 @@ static void bearerbox_to_sql(void *arg)
 
 static void sql_single(Boxc *boxc)
 {
-    Msg *msg;
+    Msg *msg = NULL;
 
     while (sqlbox_status == SQL_RUNNING && boxc->alive) {
         if ((msg = gw_sql_fetch_msg()) != NULL) {

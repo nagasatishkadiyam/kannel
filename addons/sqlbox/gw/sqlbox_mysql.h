@@ -31,12 +31,12 @@ priority BIGINT(20) NULL, foreign_id VARCHAR(255) NULL)"
 #define SQLBOX_MYSQL_SELECT_QUERY "SELECT sql_id, momt, sender, receiver, udhdata, \
 msgdata, time, smsc_id, service, account, id, sms_type, mclass, mwi, coding, \
 compress, validity, deferred, dlr_mask, dlr_url, pid, alt_dcs, rpi, \
-charset, boxc_id, binfo, meta_data, priority FROM %S LIMIT 0,1"
+charset, boxc_id, binfo, meta_data, priority FROM %S ORDER BY sql_id ASC LIMIT 1 FOR UPDATE"
 
 #define SQLBOX_MYSQL_SELECT_LIST_QUERY "SELECT sql_id, momt, sender, receiver, udhdata, \
 msgdata, time, smsc_id, service, account, id, sms_type, mclass, mwi, coding, \
 compress, validity, deferred, dlr_mask, dlr_url, pid, alt_dcs, rpi, \
-charset, boxc_id, binfo, meta_data, priority FROM %S LIMIT 0,%ld"
+charset, boxc_id, binfo, meta_data, priority FROM %S ORDER BY sql_id ASC LIMIT %ld FOR UPDATE"
 
 #define SQLBOX_MYSQL_INSERT_QUERY "INSERT INTO %S ( sql_id, momt, sender, \
 receiver, udhdata, msgdata, time, smsc_id, service, account, sms_type, \
