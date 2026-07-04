@@ -20,20 +20,6 @@ static Octstr* boxc_id;
 
 static DBPool* pool = NULL;
 
-/*
- * Atomically take up to ARGV[1] elements from list KEYS[1] (LRANGE left head + LTRIM).
- * Without this script, concurrent sqlboxes each run LLEN/LRANGE/LTRIM and duplicate messages.
- */
-static const char sqlbox_redis_batch_pop_script[] =
-    "local n = redis.call('LLEN', KEYS[1]) "
-    "if n <= 0 then return {} end "
-    "local limit = tonumber(ARGV[1]) or 0 "
-    "local pick = (limit > 0 and n > limit) and limit or n "
-    "if pick <= 0 then return {} end "
-    "local elems = redis.call('LRANGE', KEYS[1], 0, pick - 1) "
-    "redis.call('LTRIM', KEYS[1], pick, -1) "
-    "return elems";
-
 static void redis_update(const Octstr* sql, const Octstr* data)
 {
     redisReply* reply;
@@ -242,6 +228,7 @@ int redis_fetch_msg_list(List* qlist, long limit)
 {
     Msg* msg = NULL;
     redisReply* res = NULL;
+    Octstr* cmd = NULL;
     char* resjson;
     json_t *root, *jsonmsg;
     json_error_t json_error;
@@ -258,10 +245,9 @@ int redis_fetch_msg_list(List* qlist, long limit)
         return 0;
     }
 
-    res = redisCommand(pc->conn, "EVAL %s 1 %s %ld",
-                       sqlbox_redis_batch_pop_script,
-                       octstr_get_cstr(sqlbox_insert_table),
-                       limit);
+    cmd = octstr_format(SQLBOX_REDIS_QUEUE_LPOP, sqlbox_insert_table, limit);
+    res = redisCommand(pc->conn, octstr_get_cstr(cmd));
+    octstr_destroy(cmd);
     if (res == NULL) {
         dbpool_conn_produce(pc);
         return 0;
@@ -269,6 +255,12 @@ int redis_fetch_msg_list(List* qlist, long limit)
 
     if (res->type == REDIS_REPLY_ERROR) {
         error(0, "REDIS: %s", res->str);
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
+    if (res->type == REDIS_REPLY_NIL) {
         freeReplyObject(res);
         dbpool_conn_produce(pc);
         return 0;
