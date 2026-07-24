@@ -2,6 +2,7 @@
 #ifdef HAVE_REDIS
 #include "gwlib/dbpool.h"
 #include "hiredis.h"
+#include <string.h>
 #define sqlbox_redis_c
 #include "jansson.h"
 #include "sqlbox_redis.h"
@@ -13,12 +14,248 @@ static Octstr* sqlbox_logtable;
 static Octstr* sqlbox_insert_table;
 static Octstr* sqlbox_inflight_table;
 static Octstr* boxc_id;
+static int round_robin_by_account = 1; /* default yes */
 
 /*
  * Our connection pool to redis.
  */
 
 static DBPool* pool = NULL;
+
+/* Sanitize account for Redis key segment: empty -> _default; replace : and whitespace. */
+static Octstr *redis_sanitize_account(Octstr *account)
+{
+    Octstr *out;
+    long i;
+    int c;
+
+    if (account == NULL || octstr_len(account) == 0)
+        return octstr_create("_default");
+
+    out = octstr_create("");
+    for (i = 0; i < octstr_len(account); i++) {
+        c = octstr_get_char(account, i);
+        if (c == ':' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            octstr_append_char(out, '_');
+        else
+            octstr_append_char(out, c);
+    }
+    if (octstr_len(out) == 0) {
+        octstr_destroy(out);
+        return octstr_create("_default");
+    }
+    return out;
+}
+
+static Octstr *redis_accounts_key(void)
+{
+    return octstr_format("%S:accounts", sqlbox_insert_table);
+}
+
+static Octstr *redis_rr_key(void)
+{
+    return octstr_format("%S:rr", sqlbox_insert_table);
+}
+
+static Octstr *redis_acct_queue_key(Octstr *sanitized_account)
+{
+    return octstr_format("%S:acct:%S", sqlbox_insert_table, sanitized_account);
+}
+
+/* Parse one Redis JSON payload into Msg; returns NULL on bad JSON. */
+static Msg *redis_msg_from_json_cstr(const char *resjson)
+{
+    json_t *root, *jsonmsg;
+    json_error_t jerr;
+    Msg *msg;
+
+    if (resjson == NULL)
+        return NULL;
+
+    root = json_loads(resjson, 0, &jerr);
+    if (!root) {
+        warning(0, "sqlbox: Invalid JSON in message retrieved from Redis. Skipping message.");
+        return NULL;
+    }
+
+    jsonmsg = json_object_get(root, "msg");
+    if (!json_is_object(jsonmsg)) {
+        warning(0, "sqlbox: JSON does not include 'msg' root element. Skipping message.");
+        json_decref(root);
+        return NULL;
+    }
+
+    msg = redis_create_msg(jsonmsg);
+    json_decref(root);
+    return msg;
+}
+
+/*
+ * Fair LPOP via Lua. Appends up to `limit` msgs to qlist (if non-NULL) or
+ * returns a single Msg when qlist is NULL and limit==1.
+ * Returns count of messages obtained from per-account queues.
+ */
+static int redis_fair_lpop(List *qlist, long limit, Msg **single_out)
+{
+    DBPoolConn *pc;
+    redisReply *res;
+    Octstr *accounts_key, *rr_key;
+    int j, k = 0;
+    Msg *msg;
+
+    if (single_out != NULL)
+        *single_out = NULL;
+
+    if (limit <= 0)
+        return 0;
+
+    pc = dbpool_conn_consume(pool);
+    if (pc == NULL) {
+        error(0, "REDIS: Database pool got no connection! DB update failed!");
+        return 0;
+    }
+
+    accounts_key = redis_accounts_key();
+    rr_key = redis_rr_key();
+
+    {
+        const char *argv[7];
+        size_t argvlen[7];
+        Octstr *limit_os;
+
+        limit_os = octstr_format("%ld", limit);
+        argv[0] = "EVAL";
+        argvlen[0] = 4;
+        argv[1] = SQLBOX_REDIS_LUA_FAIR_LPOP;
+        argvlen[1] = strlen(SQLBOX_REDIS_LUA_FAIR_LPOP);
+        argv[2] = "2";
+        argvlen[2] = 1;
+        argv[3] = octstr_get_cstr(accounts_key);
+        argvlen[3] = octstr_len(accounts_key);
+        argv[4] = octstr_get_cstr(rr_key);
+        argvlen[4] = octstr_len(rr_key);
+        argv[5] = octstr_get_cstr(sqlbox_insert_table);
+        argvlen[5] = octstr_len(sqlbox_insert_table);
+        argv[6] = octstr_get_cstr(limit_os);
+        argvlen[6] = octstr_len(limit_os);
+        res = redisCommandArgv(pc->conn, 7, argv, argvlen);
+        octstr_destroy(limit_os);
+    }
+
+    octstr_destroy(accounts_key);
+    octstr_destroy(rr_key);
+
+    if (res == NULL) {
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+    if (res->type == REDIS_REPLY_ERROR) {
+        error(0, "REDIS fair LPOP: %s", res->str);
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+    if (res->type != REDIS_REPLY_ARRAY || res->elements == 0) {
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
+    if (qlist != NULL)
+        gwlist_add_producer(qlist);
+
+    for (j = 0; j < (int)res->elements; j++) {
+        if (res->element[j] == NULL || res->element[j]->type != REDIS_REPLY_STRING)
+            continue;
+        msg = redis_msg_from_json_cstr(res->element[j]->str);
+        if (msg == NULL)
+            continue;
+        if (qlist != NULL) {
+            gwlist_produce(qlist, msg);
+            k++;
+        } else if (single_out != NULL && *single_out == NULL) {
+            *single_out = msg;
+            k = 1;
+            /* discard any extras (should not happen with limit 1) */
+        } else {
+            msg_destroy(msg);
+        }
+    }
+
+    if (qlist != NULL)
+        gwlist_remove_producer(qlist);
+
+    freeReplyObject(res);
+    dbpool_conn_produce(pc);
+    return k;
+}
+
+/* Fill remainder from legacy shared list via LPOP N. Returns count added. */
+static int redis_legacy_lpop_fill(List *qlist, long limit, Msg **single_out)
+{
+    DBPoolConn *pc;
+    redisReply *res;
+    Octstr *cmd;
+    int j, k = 0;
+    Msg *msg;
+
+    if (limit <= 0)
+        return 0;
+
+    pc = dbpool_conn_consume(pool);
+    if (pc == NULL) {
+        error(0, "REDIS: Database pool got no connection! DB update failed!");
+        return 0;
+    }
+
+    cmd = octstr_format(SQLBOX_REDIS_QUEUE_LPOP, sqlbox_insert_table, limit);
+    res = redisCommand(pc->conn, octstr_get_cstr(cmd));
+    octstr_destroy(cmd);
+
+    if (res == NULL) {
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+    if (res->type == REDIS_REPLY_ERROR) {
+        error(0, "REDIS: %s", res->str);
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+    if (res->type == REDIS_REPLY_NIL || res->type != REDIS_REPLY_ARRAY || res->elements == 0) {
+        freeReplyObject(res);
+        dbpool_conn_produce(pc);
+        return 0;
+    }
+
+    /* Redis LPOP key count may return a single string when count==1 on some versions */
+    if (qlist != NULL)
+        gwlist_add_producer(qlist);
+
+    for (j = 0; j < (int)res->elements; j++) {
+        if (res->element[j] == NULL || res->element[j]->type != REDIS_REPLY_STRING)
+            continue;
+        msg = redis_msg_from_json_cstr(res->element[j]->str);
+        if (msg == NULL)
+            continue;
+        if (qlist != NULL) {
+            gwlist_produce(qlist, msg);
+            k++;
+        } else if (single_out != NULL && *single_out == NULL) {
+            *single_out = msg;
+            k = 1;
+        } else {
+            msg_destroy(msg);
+        }
+    }
+
+    if (qlist != NULL)
+        gwlist_remove_producer(qlist);
+
+    freeReplyObject(res);
+    dbpool_conn_produce(pc);
+    return k;
+}
 
 static void redis_update(const Octstr* sql, const Octstr* data)
 {
@@ -103,11 +340,19 @@ void sqlbox_configure_redis(Cfg* cfg)
     }
     sqlbox_inflight_table = cfg_get(grp, octstr_imm("sql-inflight-table"));
 
+    if (cfg_get_bool(&round_robin_by_account, grp, octstr_imm("round-robin-by-account")) == -1)
+        round_robin_by_account = 1;
+
     json_set_alloc_funcs(gw_malloc_json, gw_free_json);
 
     boxc_id = cfg_get(grp, octstr_imm("smsbox-id"));
     if (boxc_id == NULL)
         boxc_id = cfg_get(grp, octstr_imm("id"));
+
+    if (round_robin_by_account) {
+        info(0, "REDIS: round-robin-by-account enabled for insert queue %s",
+             octstr_get_cstr(sqlbox_insert_table));
+    }
 
     /* no need to create tables on redis */
 }
@@ -162,6 +407,13 @@ Msg* redis_fetch_msg()
 
     info(0, "REDIS: fetching message from %s", octstr_get_cstr(sqlbox_insert_table));
 
+    if (round_robin_by_account) {
+        redis_fair_lpop(NULL, 1, &msg);
+        if (msg == NULL)
+            redis_legacy_lpop_fill(NULL, 1, &msg);
+        return msg;
+    }
+
     if (sqlbox_inflight_table != NULL) {
         sql = octstr_format(SQLBOX_REDIS_QUEUE_POP_WITH_INFLIGHT, sqlbox_insert_table, sqlbox_inflight_table);
     } else {
@@ -180,14 +432,17 @@ Msg* redis_fetch_msg()
         resjson = res->str;
     } else if (res->type == REDIS_REPLY_NIL) { /* No messages queued - loop */
         freeReplyObject(res);
+        octstr_destroy(sql);
         return NULL;
     } else if (res->type == REDIS_REPLY_ERROR) {
         warning(0, "REDIS command %s failed with error %s", octstr_get_cstr(sql), res->str);
         freeReplyObject(res);
+        octstr_destroy(sql);
         return NULL;
     } else {
         warning(0, "REDIS command %s return unknown status", octstr_get_cstr(sql));
         freeReplyObject(res);
+        octstr_destroy(sql);
         return NULL;
     }
 
@@ -195,6 +450,7 @@ Msg* redis_fetch_msg()
     if (!root) {
         warning(0, "sqlbox: Invalid JSON in message retrieved from Redis. Skipping message.");
         freeReplyObject(res);
+        octstr_destroy(sql);
         return NULL;
     }
 
@@ -203,6 +459,7 @@ Msg* redis_fetch_msg()
         warning(0, "sqlbox: JSON does not include 'msg' root element. Skipping message.");
         json_decref(root);
         freeReplyObject(res);
+        octstr_destroy(sql);
         return NULL;
     }
 
@@ -216,6 +473,7 @@ Msg* redis_fetch_msg()
         sql_update(delet, jsonstr);
         octstr_destroy(delet);
         octstr_destroy(jsonstr);
+        octstr_destroy(subst);
     }
 
     json_decref(root);
@@ -235,9 +493,18 @@ int redis_fetch_msg_list(List* qlist, long limit)
     DBPoolConn* pc;
     int j;
     int k = 0;
+    long remain;
 
     if (limit <= 0)
         return 0;
+
+    if (round_robin_by_account) {
+        k = redis_fair_lpop(qlist, limit, NULL);
+        remain = limit - k;
+        if (remain > 0)
+            k += redis_legacy_lpop_fill(qlist, remain, NULL);
+        return k;
+    }
 
     pc = dbpool_conn_consume(pool);
     if (pc == NULL) {
@@ -443,6 +710,80 @@ Octstr* redis_save_msg_create(Msg* msg, Octstr* momt)
     gw_free(json);
 
     return jsonstr;
+}
+
+/*
+ * Enqueue MT JSON onto per-account RR queues (RPUSH + SADD via Lua).
+ * Producers should call this (or equivalent) when round-robin-by-account is enabled.
+ * Returns 0 on success, -1 on failure.
+ */
+int redis_enqueue_mt(Octstr *account, Octstr *jsonstr)
+{
+    DBPoolConn *pc;
+    redisReply *res;
+    Octstr *sanitized, *accounts_key, *queue_key;
+    int rc = -1;
+
+    if (jsonstr == NULL || sqlbox_insert_table == NULL)
+        return -1;
+
+    if (!round_robin_by_account) {
+        /* Fall back to legacy shared list */
+        Octstr *subst, *sql;
+        subst = octstr_create("%s");
+        sql = octstr_format(SQLBOX_REDIS_QUEUE_PUSH, sqlbox_insert_table, subst);
+        sql_update(sql, jsonstr);
+        octstr_destroy(sql);
+        octstr_destroy(subst);
+        return 0;
+    }
+
+    pc = dbpool_conn_consume(pool);
+    if (pc == NULL) {
+        error(0, "REDIS: Database pool got no connection! DB update failed!");
+        return -1;
+    }
+
+    sanitized = redis_sanitize_account(account);
+    accounts_key = redis_accounts_key();
+    queue_key = redis_acct_queue_key(sanitized);
+
+    {
+        const char *argv[7];
+        size_t argvlen[7];
+
+        argv[0] = "EVAL";
+        argvlen[0] = 4;
+        argv[1] = SQLBOX_REDIS_LUA_ENQUEUE;
+        argvlen[1] = strlen(SQLBOX_REDIS_LUA_ENQUEUE);
+        argv[2] = "2";
+        argvlen[2] = 1;
+        argv[3] = octstr_get_cstr(accounts_key);
+        argvlen[3] = octstr_len(accounts_key);
+        argv[4] = octstr_get_cstr(queue_key);
+        argvlen[4] = octstr_len(queue_key);
+        argv[5] = octstr_get_cstr(sanitized);
+        argvlen[5] = octstr_len(sanitized);
+        argv[6] = octstr_get_cstr(jsonstr);
+        argvlen[6] = octstr_len(jsonstr);
+        res = redisCommandArgv(pc->conn, 7, argv, argvlen);
+    }
+
+    if (res == NULL) {
+        error(0, "REDIS enqueue: no reply");
+    } else if (res->type == REDIS_REPLY_ERROR) {
+        error(0, "REDIS enqueue: %s", res->str);
+    } else {
+        rc = 0;
+    }
+
+    if (res != NULL)
+        freeReplyObject(res);
+    octstr_destroy(sanitized);
+    octstr_destroy(accounts_key);
+    octstr_destroy(queue_key);
+    dbpool_conn_produce(pc);
+    return rc;
 }
 
 void redis_leave()

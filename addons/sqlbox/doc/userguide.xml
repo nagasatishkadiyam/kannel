@@ -567,9 +567,30 @@ bearerbox-port = 13001
                 </entry>
                 <entry>number</entry>
                 <entry valign="bottom">Sqlbox processes this number of messages at a time. Note:
-                    Currently only the MySQL driver supports this configuration directive. Defaults to 10.
+                    Currently MySQL and Redis drivers support this configuration directive. Defaults to 10.
                     If you raise this number high enough, you might want to increase max_allowed_packet in your
                     MySQL configuration.</entry>
+              </row>
+              <row>
+                <entry>
+                  <literal>round-robin-by-account (o)</literal>
+                </entry>
+                <entry>bool</entry>
+                <entry valign="bottom">When enabled (default yes), sqlbox fetches MT messages
+                    fairly across <literal>account</literal> values so one high-volume account
+                    cannot starve small accounts in the insert queue.
+                    <para>MySQL: SELECT uses <literal>ROW_NUMBER() OVER (PARTITION BY account)</literal>
+                    (MySQL 8+). The insert table is created with composite index
+                    <literal>idx_account_sql_id (account, sql_id)</literal>; existing databases
+                    get the index on startup via <literal>CREATE INDEX</literal>.</para>
+                    <para>Redis: uses per-account lists <literal>{sql-insert-table}:acct:{account}</literal>,
+                    set <literal>{sql-insert-table}:accounts</literal>, and a round-robin cursor.
+                    Producers must enqueue with <literal>RPUSH</literal> to the account list and
+                    <literal>SADD</literal> to the accounts set (or the atomic Lua enqueue helper).
+                    The legacy shared list is still drained for back-compat but is not fair.
+                    Empty account maps to <literal>_default</literal>; <literal>:</literal> and
+                    whitespace in account names are replaced with <literal>_</literal>.</para>
+                    Set to no to restore global FIFO fetch.</entry>
               </row>
               <row>
                 <entry>
@@ -647,6 +668,7 @@ smsbox-port = 13005
 smsbox-port-ssl = false
 sql-log-table = sent_sms
 sql-insert-table = send_sms
+round-robin-by-account = yes
 log-file = "/var/log/kannel/kannel-sqlbox.log"
 log-level = 0
 </programlisting>
@@ -1285,6 +1307,9 @@ max-connections = 1
   uses, but having a different structure, this will probably cause problems and there's a good chance the
   process will panic and stop. In that case, rename/drop the offending tables or change the names Sqlbox
   uses by using the <literal>sql-log-table</literal> and <literal>sql-insert-table</literal> variables.</para>
+  <para>For MySQL, the insert table includes composite index <literal>idx_account_sql_id (account, sql_id)</literal>
+  to support <literal>round-robin-by-account</literal>. On startup sqlbox also runs
+  <literal>CREATE INDEX</literal> so existing installations receive the index without recreating the table.</para>
 </sect2>
 </sect1>
 

@@ -10,6 +10,9 @@
 
 static Octstr *sqlbox_logtable;
 static Octstr *sqlbox_insert_table;
+static int round_robin_by_account = 1; /* default yes */
+
+#define MYSQL_ERR_DUP_KEYNAME 1061
 
 /*
  * Our connection pool to mysql.
@@ -77,6 +80,8 @@ void sqlbox_configure_mysql(Cfg* cfg)
 {
     CfgGroup *grp;
     Octstr *sql;
+    DBPoolConn *pc;
+    int state;
 
     if (!(grp = cfg_get_single_group(cfg, octstr_imm("sqlbox"))))
         panic(0, "SQLBOX: MySQL: group 'sqlbox' is not specified!");
@@ -90,12 +95,31 @@ void sqlbox_configure_mysql(Cfg* cfg)
         panic(0, "No 'sql-insert-table' not configured.");
     }
 
+    if (cfg_get_bool(&round_robin_by_account, grp, octstr_imm("round-robin-by-account")) == -1)
+        round_robin_by_account = 1;
+
     /* create send_sms && sent_sms tables if they do not exist */
     sql = octstr_format(SQLBOX_MYSQL_CREATE_LOG_TABLE, sqlbox_logtable);
     sql_update(sql);
     octstr_destroy(sql);
     sql = octstr_format(SQLBOX_MYSQL_CREATE_INSERT_TABLE, sqlbox_insert_table);
     sql_update(sql);
+    octstr_destroy(sql);
+
+    /*
+     * Ensure composite index for RR SELECT exists on existing installs
+     * (CREATE TABLE IF NOT EXISTS does not add new keys to old tables).
+     * Ignore duplicate-key-name if already present from CREATE TABLE.
+     */
+    sql = octstr_format(SQLBOX_MYSQL_CREATE_INSERT_INDEX, sqlbox_insert_table);
+    pc = dbpool_conn_consume(pool);
+    if (pc != NULL) {
+        state = mysql_query(pc->conn, octstr_get_cstr(sql));
+        if (state != 0 && mysql_errno(pc->conn) != MYSQL_ERR_DUP_KEYNAME) {
+            error(0, "MYSQL: %s", mysql_error(pc->conn));
+        }
+        dbpool_conn_produce(pc);
+    }
     octstr_destroy(sql);
     /* end table creation */
 }
@@ -165,7 +189,10 @@ Msg *mysql_fetch_msg()
     }
     conn = pc->conn;
 
-    sql = octstr_format(SQLBOX_MYSQL_SELECT_QUERY, sqlbox_insert_table);
+    if (round_robin_by_account)
+        sql = octstr_format(SQLBOX_MYSQL_SELECT_RR_QUERY, sqlbox_insert_table, sqlbox_insert_table);
+    else
+        sql = octstr_format(SQLBOX_MYSQL_SELECT_QUERY, sqlbox_insert_table);
 
     mysql_autocommit(conn, 0);
     if (mysql_query(conn, "START TRANSACTION") != 0) {
@@ -265,7 +292,10 @@ int mysql_fetch_msg_list(List *qlist, long limit)
         goto fail_early;
     }
 
-    sql = octstr_format(SQLBOX_MYSQL_SELECT_LIST_QUERY, sqlbox_insert_table, limit);
+    if (round_robin_by_account)
+        sql = octstr_format(SQLBOX_MYSQL_SELECT_LIST_RR_QUERY, sqlbox_insert_table, sqlbox_insert_table, limit);
+    else
+        sql = octstr_format(SQLBOX_MYSQL_SELECT_LIST_QUERY, sqlbox_insert_table, limit);
     if (mysql_query(conn, octstr_get_cstr(sql)) != 0) {
         error(0, "MYSQL: %s", mysql_error(conn));
         if (mysql_errno(conn) == MYSQL_ERR_NOSUCHFIELD) {

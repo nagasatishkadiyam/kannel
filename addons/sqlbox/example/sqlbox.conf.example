@@ -8,6 +8,12 @@ smsbox-port = 13005
 smsbox-port-ssl = false
 sql-log-table = sent_sms
 sql-insert-table = send_sms
+# Fair scheduling across accounts (default yes). Prevents one high-volume
+# account from delaying small-volume accounts in the insert queue.
+# Redis: requires producers to enqueue per-account (see comments below).
+# MySQL: uses ROW_NUMBER() over account (MySQL 8+); creates idx_account_sql_id.
+round-robin-by-account = yes
+#limit-per-cycle = 10
 log-file = "/var/log/kannel/kannel-sqlbox.log"
 log-level = 0
 #ssl-client-certkey-file = ""
@@ -73,3 +79,10 @@ log-level = 0
 #
 # Optional in sqlbox group for reliable message processing (BRPOPLPUSH):
 #sql-inflight-table = send_sms_inflight
+#
+# With round-robin-by-account = yes, producers must NOT only RPUSH to send_sms.
+# Enqueue per account (account sanitized: empty -> _default; ':'/whitespace -> '_'):
+#   RPUSH  send_sms:acct:<account>  <json>
+#   SADD   send_sms:accounts        <account>
+# Or one atomic EVAL using sqlbox's enqueue Lua (KEYS: accounts set + acct queue;
+# ARGV: sanitized account, JSON). Legacy RPUSH to send_sms is still drained but is not fair.

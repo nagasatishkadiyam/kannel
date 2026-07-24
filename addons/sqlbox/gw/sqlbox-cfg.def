@@ -19,6 +19,7 @@ SINGLE_GROUP(sqlbox,
     OCTSTR(log-level)
     OCTSTR(bearerbox-port)
     OCTSTR(limit-per-cycle)
+    OCTSTR(round-robin-by-account)
     OCTSTR(save-mo)
     OCTSTR(save-mt)
     OCTSTR(save-dlr)

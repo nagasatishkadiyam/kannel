@@ -26,7 +26,11 @@ compress BIGINT(20) NULL, validity BIGINT(20) NULL, deferred BIGINT(20) NULL, \
 dlr_mask BIGINT(20) NULL, dlr_url TEXT NULL, pid BIGINT(20) NULL, \
 alt_dcs BIGINT(20) NULL, rpi BIGINT(20) NULL, charset VARCHAR(255) NULL, \
 boxc_id VARCHAR(255) NULL, binfo VARCHAR(255) NULL, meta_data TEXT, \
-priority BIGINT(20) NULL, foreign_id VARCHAR(255) NULL)"
+priority BIGINT(20) NULL, foreign_id VARCHAR(255) NULL, \
+KEY idx_account_sql_id (account, sql_id))"
+
+#define SQLBOX_MYSQL_CREATE_INSERT_INDEX \
+"CREATE INDEX idx_account_sql_id ON %S (account, sql_id)"
 
 #define SQLBOX_MYSQL_SELECT_QUERY "SELECT sql_id, momt, sender, receiver, udhdata, \
 msgdata, time, smsc_id, service, account, id, sms_type, mclass, mwi, coding, \
@@ -37,6 +41,33 @@ charset, boxc_id, binfo, meta_data, priority FROM %S ORDER BY sql_id ASC LIMIT 1
 msgdata, time, smsc_id, service, account, id, sms_type, mclass, mwi, coding, \
 compress, validity, deferred, dlr_mask, dlr_url, pid, alt_dcs, rpi, \
 charset, boxc_id, binfo, meta_data, priority FROM %S ORDER BY sql_id ASC LIMIT %ld FOR UPDATE"
+
+/* Round-robin by account: interleave oldest row per account via ROW_NUMBER (MySQL 8+). */
+#define SQLBOX_MYSQL_SELECT_RR_QUERY "SELECT s.sql_id, s.momt, s.sender, s.receiver, s.udhdata, \
+s.msgdata, s.time, s.smsc_id, s.service, s.account, s.id, s.sms_type, s.mclass, s.mwi, s.coding, \
+s.compress, s.validity, s.deferred, s.dlr_mask, s.dlr_url, s.pid, s.alt_dcs, s.rpi, \
+s.charset, s.boxc_id, s.binfo, s.meta_data, s.priority \
+FROM %S s \
+INNER JOIN ( \
+  SELECT sql_id, \
+    ROW_NUMBER() OVER (PARTITION BY IFNULL(account, '') ORDER BY sql_id ASC) AS acct_rn \
+  FROM %S \
+) ranked ON s.sql_id = ranked.sql_id \
+ORDER BY ranked.acct_rn ASC, s.sql_id ASC \
+LIMIT 1 FOR UPDATE"
+
+#define SQLBOX_MYSQL_SELECT_LIST_RR_QUERY "SELECT s.sql_id, s.momt, s.sender, s.receiver, s.udhdata, \
+s.msgdata, s.time, s.smsc_id, s.service, s.account, s.id, s.sms_type, s.mclass, s.mwi, s.coding, \
+s.compress, s.validity, s.deferred, s.dlr_mask, s.dlr_url, s.pid, s.alt_dcs, s.rpi, \
+s.charset, s.boxc_id, s.binfo, s.meta_data, s.priority \
+FROM %S s \
+INNER JOIN ( \
+  SELECT sql_id, \
+    ROW_NUMBER() OVER (PARTITION BY IFNULL(account, '') ORDER BY sql_id ASC) AS acct_rn \
+  FROM %S \
+) ranked ON s.sql_id = ranked.sql_id \
+ORDER BY ranked.acct_rn ASC, s.sql_id ASC \
+LIMIT %ld FOR UPDATE"
 
 #define SQLBOX_MYSQL_INSERT_QUERY "INSERT INTO %S ( sql_id, momt, sender, \
 receiver, udhdata, msgdata, time, smsc_id, service, account, sms_type, \
