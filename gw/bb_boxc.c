@@ -87,7 +87,7 @@
 extern volatile sig_atomic_t bb_status;
 extern volatile sig_atomic_t restart;
 extern List *incoming_sms;
-extern List *outgoing_sms;
+extern BBFairQueue *outgoing_sms;
 extern List *incoming_wdp;
 extern List *outgoing_wdp;
 
@@ -675,7 +675,7 @@ static void run_smsbox(void *arg)
     newconn->incoming = gwlist_create();
     gwlist_add_producer(newconn->incoming);
     newconn->retry = incoming_sms;
-    newconn->outgoing = outgoing_sms;
+    newconn->outgoing = NULL; /* MT uses deliver_sms_to_queue; producers on fairqueue */
     newconn->sent = dict_create(smsbox_max_pending, NULL);
     newconn->pending = semaphore_create(smsbox_max_pending);
 
@@ -695,9 +695,9 @@ static void run_smsbox(void *arg)
     gwlist_append(smsbox_list, newconn);
     gw_rwlock_unlock(smsbox_list_rwlock);
 
-    gwlist_add_producer(newconn->outgoing);
+    bb_fairqueue_add_producer(outgoing_sms);
     boxc_receiver(newconn);
-    gwlist_remove_producer(newconn->outgoing);
+    bb_fairqueue_remove_producer(outgoing_sms);
 
     /* remove us from smsbox routing list */
     gw_rwlock_wrlock(smsbox_list_rwlock);
@@ -1039,7 +1039,7 @@ static void smsboxc_run(void *arg)
     gwlist_remove_producer(smsbox_list);
 
     /* continue avalanche */
-    gwlist_remove_producer(outgoing_sms);
+    bb_fairqueue_remove_producer(outgoing_sms);
 
     /* all connections do the same, so that all must remove() before it
      * is completely over
@@ -1298,7 +1298,7 @@ int smsbox_start(Cfg *cfg)
     /* load the defined smsbox routing rules */
     init_smsbox_routes(cfg, 0);
 
-    gwlist_add_producer(outgoing_sms);
+    bb_fairqueue_add_producer(outgoing_sms);
     gwlist_add_producer(smsbox_list);
 
     smsbox_running = 1;

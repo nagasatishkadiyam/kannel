@@ -136,6 +136,7 @@ SINGLE_GROUP(core,
     OCTSTR(maximum-queue-length)    /* deprecated, supported until next major stable release */
     OCTSTR(sms-incoming-queue-limit)
     OCTSTR(sms-outgoing-queue-limit)
+    OCTSTR(round-robin-by-account)
     OCTSTR(sms-resend-freq)
     OCTSTR(sms-resend-retry)
     OCTSTR(sms-combine-concatenated-mo)

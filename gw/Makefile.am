@@ -67,6 +67,7 @@ bearerbox_LDADD = $(top_builddir)/gwlib/libgwlib.la libgw.la $(top_builddir)/wap
 bearerbox_SOURCES = \
 	bb_alog.c \
 	bb_boxc.c \
+	bb_fairqueue.c \
 	bb_http.c \
 	bb_smscconn.c \
 	bb_udp.c \
@@ -112,6 +113,7 @@ includedir = $(prefix)/include/kannel/gw
 nobase_include_HEADERS = \
 	alt_charsets.h \
 	bb.h \
+	bb_fairqueue.h \
 	bb_smscconn_cb.h \
 	bb_store.h \
 	dlr.h \

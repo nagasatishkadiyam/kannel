@@ -78,11 +78,12 @@
 #include "shared.h"
 #include "dlr.h"
 #include "load.h"
+#include "bb_fairqueue.h"
 
 /* global variables; included to other modules as needed */
 
 List *incoming_sms;
-List *outgoing_sms;
+BBFairQueue *outgoing_sms;
 
 List *incoming_wdp;
 List *outgoing_wdp;
@@ -97,6 +98,9 @@ Counter *outgoing_wdp_counter;
 /* incoming/outgoing sms queue control */
 long max_incoming_sms_qlength;
 long max_outgoing_sms_qlength;
+
+/* account round-robin fairness for outgoing_sms and SMPP queues */
+int bb_round_robin_by_account = 1;
 
 
 Load *outgoing_sms_load;
@@ -505,7 +509,13 @@ static Cfg *init_bearerbox(Cfg *cfg)
 
     /* if all seems to be OK by the first glimpse, real start-up */
 
-    outgoing_sms = gwlist_create();
+    if (cfg_get_bool(&bb_round_robin_by_account, grp,
+                     octstr_imm("round-robin-by-account")) == -1)
+        bb_round_robin_by_account = 1;
+
+    outgoing_sms = bb_fairqueue_create(bb_round_robin_by_account, NULL);
+    if (bb_round_robin_by_account)
+        info(0, "Bearerbox round-robin-by-account enabled for outgoing SMS queue.");
     incoming_sms = gwlist_create();
     outgoing_wdp = gwlist_create();
     incoming_wdp = gwlist_create();
@@ -636,9 +646,9 @@ static void empty_msg_lists(void)
     
 #ifndef NO_SMS
     /* XXX we should record these so that they are not forever lost... */
-    if (gwlist_len(incoming_sms) > 0 || gwlist_len(outgoing_sms) > 0)
+    if (gwlist_len(incoming_sms) > 0 || bb_fairqueue_len(outgoing_sms) > 0)
         debug("bb", 0, "Remaining SMS: %ld incoming, %ld outgoing",
-              gwlist_len(incoming_sms), gwlist_len(outgoing_sms));
+              gwlist_len(incoming_sms), bb_fairqueue_len(outgoing_sms));
 
     info(0, "Total SMS messages: received %ld, dlr %ld, sent %ld, dlr %ld",
          counter_value(incoming_sms_counter),
@@ -648,7 +658,7 @@ static void empty_msg_lists(void)
 #endif
 
     gwlist_destroy(incoming_sms, msg_destroy_item);
-    gwlist_destroy(outgoing_sms, msg_destroy_item);
+    bb_fairqueue_destroy(outgoing_sms, msg_destroy_item);
     
     counter_destroy(incoming_sms_counter);
     counter_destroy(incoming_dlr_counter);
@@ -673,7 +683,7 @@ static void dispatch_into_queue(Msg *msg)
         case mt_push:
         case mt_reply:
         case report_mt:
-            gwlist_append(outgoing_sms, msg);
+            bb_fairqueue_append(outgoing_sms, msg);
             break;
         case mo:
         case report_mo:
@@ -1087,7 +1097,7 @@ Octstr *bb_print_status(int status_type)
         gwlist_len(incoming_wdp) + boxc_incoming_wdp_queue(),
         counter_value(outgoing_wdp_counter), gwlist_len(outgoing_wdp) + udp_outgoing_queue(),
         counter_value(incoming_sms_counter), gwlist_len(incoming_sms),
-        counter_value(outgoing_sms_counter), gwlist_len(outgoing_sms),
+        counter_value(outgoing_sms_counter), bb_fairqueue_len(outgoing_sms),
         store_messages(),
         load_get(incoming_sms_load,0), load_get(incoming_sms_load,1), load_get(incoming_sms_load,2),
         load_get(outgoing_sms_load,0), load_get(outgoing_sms_load,1), load_get(outgoing_sms_load,2),

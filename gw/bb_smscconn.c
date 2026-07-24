@@ -93,12 +93,13 @@
 #include "smscconn_p.h"        /* to access counters */
 
 #include "smsc/smpp_pdu.h"     /* access smpp_pdu_init/smpp_pdu_shutdown */
+#include "bb_fairqueue.h"
 
 /* passed from bearerbox core */
 
 extern volatile sig_atomic_t bb_status;
 extern List *incoming_sms;
-extern List *outgoing_sms;
+extern BBFairQueue *outgoing_sms;
 
 extern Counter *incoming_sms_counter;
 extern Counter *outgoing_sms_counter;
@@ -236,7 +237,7 @@ static void handle_split(SMSCConn *conn, Msg *msg, long reason, Octstr *reply)
             msg->sms.resend_try = (msg->sms.resend_try > 0 ? msg->sms.resend_try + 1 : 1);
             time(&msg->sms.resend_time);
         }
-        gwlist_produce(outgoing_sms, msg);
+        bb_fairqueue_produce(outgoing_sms, msg);
         return;
     case SMSCCONN_FAILED_DISCARDED:
     case SMSCCONN_FAILED_REJECTED:
@@ -354,11 +355,11 @@ void bb_smscconn_send_failed(SMSCConn *conn, Msg *sms, int reason, Octstr *reply
            sms->sms.resend_try = (sms->sms.resend_try > 0 ? sms->sms.resend_try + 1 : 1);
            time(&sms->sms.resend_time);
        }
-       gwlist_produce(outgoing_sms, sms);
+       bb_fairqueue_produce(outgoing_sms, sms);
        break;
        
     case SMSCCONN_FAILED_SHUTDOWN:
-        gwlist_produce(outgoing_sms, sms);
+        bb_fairqueue_produce(outgoing_sms, sms);
         break;
 
     default:
@@ -668,12 +669,12 @@ static void sms_router(void *arg)
                 double sleep_time = (sms_resend_frequency / 2 > 1 ? sms_resend_frequency / 2 : sms_resend_frequency);
                 debug("bb.sms", 0, "sms_router: time to sleep %.2f secs.", sleep_time);
                 gwthread_sleep(sleep_time);
-                debug("bb.sms", 0, "sms_router: gwlist_len = %ld", gwlist_len(outgoing_sms));
+                debug("bb.sms", 0, "sms_router: fairqueue_len = %ld", bb_fairqueue_len(outgoing_sms));
             }
-            startmsg = msg = gwlist_timed_consume(outgoing_sms, concatenated_mo_timeout);
+            startmsg = msg = bb_fairqueue_timed_consume(outgoing_sms, concatenated_mo_timeout);
             newmsg = NULL;
         } else {
-            newmsg = msg = gwlist_timed_consume(outgoing_sms, concatenated_mo_timeout);
+            newmsg = msg = bb_fairqueue_timed_consume(outgoing_sms, concatenated_mo_timeout);
         }
 
         if (difftime(time(NULL), concat_mo_check) > concatenated_mo_timeout) {
@@ -694,7 +695,7 @@ static void sms_router(void *arg)
         if (msg->sms.resend_try > 0 && difftime(time(NULL), msg->sms.resend_time) < sms_resend_frequency &&
             bb_status != BB_SHUTDOWN && bb_status != BB_DEAD) {
             debug("bb.sms", 0, "re-queing SMS not-yet-to-be resent");
-            gwlist_produce(outgoing_sms, msg);
+            bb_fairqueue_produce(outgoing_sms, msg);
             ret = SMSCCONN_QUEUED;
             continue;
         }
@@ -714,7 +715,7 @@ static void sms_router(void *arg)
             break;
         case SMSCCONN_FAILED_QFULL:
             debug("bb.sms", 0, "Routing failed, re-queuing.");
-            gwlist_produce(outgoing_sms, msg);
+            bb_fairqueue_produce(outgoing_sms, msg);
             break;
         case SMSCCONN_FAILED_EXPIRED:
             debug("bb.sms", 0, "Routing failed, expired.");
@@ -1826,7 +1827,7 @@ long smsc2_rout(Msg *msg, int resend)
     	 * and 80% for new msgs. So we can guarantee that old msgs find
     	 * place in the SMSC's queue.
     	 */
-    	if (gwlist_len(outgoing_sms) > 0) {
+    	if (bb_fairqueue_len(outgoing_sms) > 0) {
     		max_queue = (resend ? max_outgoing_sms_qlength :
     		max_outgoing_sms_qlength * 0.8);
     	} else
@@ -1871,7 +1872,7 @@ long smsc2_rout(Msg *msg, int resend)
     			bo_load = stat.load;
     		}
     	}
-    	queue_length += gwlist_len(outgoing_sms);
+    	queue_length += bb_fairqueue_len(outgoing_sms);
     	if (max_outgoing_sms_qlength > 0 && !resend &&
     	    queue_length > gwlist_len(smsc_list) * max_outgoing_sms_qlength) {
     		gw_rwlock_unlock(&smsc_list_lock);
@@ -1891,8 +1892,8 @@ long smsc2_rout(Msg *msg, int resend)
         ret = smscconn_send(best_ok, msg);
     else if (bad_found) {
         gw_rwlock_unlock(&smsc_list_lock);
-        if (max_outgoing_sms_qlength < 0 || gwlist_len(outgoing_sms) < max_outgoing_sms_qlength) {
-            gwlist_produce(outgoing_sms, msg);
+        if (max_outgoing_sms_qlength < 0 || bb_fairqueue_len(outgoing_sms) < max_outgoing_sms_qlength) {
+            bb_fairqueue_produce(outgoing_sms, msg);
             return SMSCCONN_QUEUED;
         }
         debug("bb.sms", 0, "bad_found queue full");

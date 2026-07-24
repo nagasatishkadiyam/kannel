@@ -1683,6 +1683,18 @@ admin-password = f00bar
         The default value, 1 million, works for most installations.
      </entry></row>
 
+     <row><entry><literal>round-robin-by-account</literal></entry>
+     <entry>boolean</entry>
+     <entry valign="bottom">
+        When enabled (default yes), bearerbox drains the global outgoing SMS
+        queue and SMPP per-SMSC send queues fairly across
+        <literal>account</literal> values so one high-volume account cannot
+        starve small accounts. Empty or missing account maps to
+        <literal>_default</literal>. Within an account, SMPP still orders by
+        message priority then time. Set to no to restore global FIFO /
+        priority-time behavior.
+     </entry></row>
+
      <row><entry><literal>smsbox-max-pending</literal></entry>
         <entry>number of messages</entry>
         <entry valign="bottom">
